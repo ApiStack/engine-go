@@ -82,7 +82,7 @@ func (s *UdpServer) Start() {
 		data := make([]byte, n)
 		copy(data, buf[:n])
 		
-		s.handlePacket(data, addr)
+		s.handlePacket(data, addr, time.Now().UnixMilli())
 	}
 }
 
@@ -91,7 +91,7 @@ func (s *UdpServer) Stop() {
 	s.conn.Close()
 }
 
-func (s *UdpServer) handlePacket(data []byte, addr *net.UDPAddr) {
+func (s *UdpServer) handlePacket(data []byte, addr *net.UDPAddr, ts int64) {
 	// Basic loop to find magic header if multiple packets are concatenated
 	// The C++ code handles concatenation and fragmentation. 
 	// Here we assume UDP packets respect boundaries for simplicity, 
@@ -138,47 +138,84 @@ func (s *UdpServer) handlePacket(data []byte, addr *net.UDPAddr) {
 		body := data[bodyStart:bodyEnd]
 
 		// Handle Inner Packet
-		s.processInner(hdr, body)
+		s.processInner(hdr, body, ts, 0)
 
 		offset += totalLen
 	}
 }
 
-func (s *UdpServer) processInner(hdr *UnibHeader, body []byte) {
+func (s *UdpServer) processInner(hdr *UnibHeader, body []byte, ts int64, parentFlags uint8) {
 	// Handle seconds prefix if flag bit 1 is set
 	// C++: bool bSec = pkg->flags & 0x2;
 	// However, Python parser says: sec_flags = pkt.flags | parent_flags
 	// In handlePacket(UnibHeader), we have the flags.
 	
+	combinedFlags := hdr.Flags | parentFlags
 	realBody := body
-	if hdr.Flags & 0x2 != 0 && len(body) > 0 {
+	if combinedFlags & 0x2 != 0 && len(body) > 0 {
 		// sec := body[0]
 		realBody = body[1:]
 	}
 
 	tagID := int(hdr.Addr)
-	ts := time.Now().UnixMilli()
+
+	// log.Printf("Packet: Type=%x ID=%x Len=%d", hdr.Type, tagID, len(body))
 
 	switch hdr.Type {
+	case TypeLoraRawDataUp:
+		offset := 4
+		if len(realBody) >= 6 {
+			offset = 6
+		}
+		if len(realBody) <= offset {
+			return
+		}
+		innerPayload := realBody[offset:]
+		pos := 0
+		for pos+UnibWrapLen <= len(innerPayload) {
+			inHdr, err := ParseHeader(innerPayload[pos:])
+			if err != nil {
+				pos++
+				continue
+			}
+			
+			totalLen := UnibWrapLen + inHdr.BodyLen
+			if pos+totalLen > len(innerPayload) {
+				break
+			}
+			
+			inBody := innerPayload[pos+UnibHdrLen : pos+UnibHdrLen+inHdr.BodyLen]
+			s.processInner(inHdr, inBody, ts, hdr.Flags)
+			pos += totalLen
+		}
+
 	case TypeTwrFrame:
 		samples, err := ParseTwrFrame(realBody)
 		if err == nil {
 			s.feedTwr(tagID, ts, samples)
+		} else {
+			log.Printf("ParseTwrFrame error: %v", err)
 		}
 	case TypeTwrFrameS:
 		samples, err := ParseTwrFrameS(realBody)
 		if err == nil {
 			s.feedTwr(tagID, ts, samples)
+		} else {
+			log.Printf("ParseTwrFrameS error: %v", err)
 		}
 	case TypeRssiFrame:
 		samples, err := ParseRssiFrame(realBody)
 		if err == nil {
 			s.feedRssi(tagID, ts, samples)
+		} else {
+			log.Printf("ParseRssiFrame error: %v", err)
 		}
 	case TypeRssiFrameS:
 		samples, err := ParseRssiFrameS(realBody)
 		if err == nil {
 			s.feedRssi(tagID, ts, samples)
+		} else {
+			log.Printf("ParseRssiFrameS error: %v", err)
 		}
 	case TypeImuFrame:
 		imu, err := ParseImuFrame(realBody)
@@ -198,6 +235,16 @@ func (s *UdpServer) feedTwr(tagID int, ts int64, samples []TwrSample) {
 	}
 	// Empty BLE for TWR frame
 	res := s.pipeline.Process(ts, tagID, []fusion.BLEMeas{}, twrMeas, 0.0)
+	
+	/*
+	if res.NumBeacons == 0 && len(samples) > 0 {
+		log.Printf("All anchors filtered! Tag=%x Samples=%d", tagID, len(samples))
+		for _, smp := range samples {
+			log.Printf("  Sample Anc=%x Range=%.2f", smp.AnchorID, smp.RangeM)
+		}
+	}
+	*/
+	
 	s.sendResult(tagID, ts, res)
 }
 
@@ -224,7 +271,11 @@ type wsPos struct {
 }
 
 func (s *UdpServer) sendResult(tagID int, ts int64, res fusion.FusionResult) {
-	if res.Flag != 1 {
+	// Debug logging
+	if res.Flag >= 1 {
+		// log.Printf("Valid position: ID=%x X=%.2f Y=%.2f", tagID, res.X, res.Y)
+	} else {
+		// log.Printf("Invalid position: ID=%x Flag=%d Algo=%s Beacons=%d", tagID, res.Flag, res.Algo, res.NumBeacons)
 		return
 	}
 	

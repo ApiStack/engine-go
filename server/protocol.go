@@ -15,6 +15,7 @@ const (
 	TypeTwrFrameS  = 0x52
 	TypeRssiFrame  = 0x60
 	TypeRssiFrameS = 0x61
+	TypeLoraRawDataUp = 0x48
 	TypeImuFrame   = 0x90
 )
 

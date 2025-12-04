@@ -20,12 +20,15 @@ import (
 func main() {
 	port := flag.Int("port", 44333, "UDP port to listen on")
 	httpPort := flag.Int("http", 0, "HTTP/WebSocket port (e.g. 8080). 0 to disable.")
+	webRoot := flag.String("web-root", "frontend/dist", "Path to web frontend dist directory")
 	projectXML := flag.String("project", "project.xml", "Path to project.xml")
 	wogiXML := flag.String("wogi", "wogi.xml", "Path to wogi.xml")
 	signalLoss := flag.Float64("signal-loss-frac", 3.0, "BLE path-loss exponent")
 	signalAdjust := flag.Float64("signal-adjust", 8.0, "BLE adjust A at 1m")
 	deployDist := flag.Int("deploy-dist", 800, "Deployment interval cm")
 	pcapPath := flag.String("pcap", "", "Path to output PCAP file (optional)")
+	replayPath := flag.String("replay", "", "Path to input PCAP file to replay")
+	replaySpeed := flag.Float64("speed", 1.0, "Replay speed multiplier")
 	flag.Parse()
 
 	if _, err := os.Stat(*projectXML); os.IsNotExist(err) {
@@ -65,8 +68,8 @@ func main() {
 	if *httpPort > 0 {
 		webSvr := web.NewServer()
 		configDir := filepath.Dir(*projectXML)
-		// Serve static files from config directory (assuming map images are there)
-		go webSvr.Start(*httpPort, configDir)
+		// Serve static files from config directory and frontend
+		go webSvr.Start(*httpPort, *webRoot, configDir)
 		udpSvr.SetWebHub(webSvr.Hub)
 	}
 
@@ -107,8 +110,19 @@ func main() {
 		log.Printf("Logging packets to %s", path)
 	}
 
-	// Start Server in a goroutine
-	go udpSvr.Start()
+	// Start Server or Replay
+	if *replayPath != "" {
+		go func() {
+			if err := udpSvr.Replay(*replayPath, *replaySpeed); err != nil {
+				log.Printf("Replay error: %v", err)
+			}
+			// Send interrupt to self to exit after replay? 
+			// Or just let it sit idle? Let's exit.
+			syscall.Kill(os.Getpid(), syscall.SIGTERM)
+		}()
+	} else {
+		go udpSvr.Start()
+	}
 
 	// Wait for interrupt signal
 	sigChan := make(chan os.Signal, 1)

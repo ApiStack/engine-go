@@ -278,7 +278,7 @@ func (p *FusionPipeline) Process(tsMs int64, tagID int, bleMeas []BLEMeas, twrMe
         Y:           p.ekf.xk[1],
         Flag:        flag,
         UsedMea:     used,
-        NumBeacons:  len(sample.BLE),
+        NumBeacons:  len(sample.BLE) + len(sample.TWR),
         Algo:        algo,
         Layer:       layerSel,
     }
