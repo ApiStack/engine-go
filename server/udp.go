@@ -2,8 +2,10 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"engine-go/binlog"
@@ -27,6 +29,10 @@ type UdpServer struct {
 	sender   *rbc.Sender
 	webHub   *web.Hub
 	running  bool
+	
+	// Map TagID -> Last Seen Gateway Addr
+	lastGw map[int]*net.UDPAddr
+	mu     sync.Mutex
 }
 
 func NewUdpServer(port int, pipeline *fusion.FusionPipeline) (*UdpServer, error) {
@@ -48,6 +54,7 @@ func NewUdpServer(port int, pipeline *fusion.FusionPipeline) (*UdpServer, error)
 	return &UdpServer{
 		conn:     conn,
 		pipeline: pipeline,
+		lastGw:   make(map[int]*net.UDPAddr),
 	}, nil
 }
 
@@ -91,53 +98,66 @@ func (s *UdpServer) Stop() {
 	s.conn.Close()
 }
 
-func (s *UdpServer) handlePacket(data []byte, addr *net.UDPAddr, ts int64) {
-	// Basic loop to find magic header if multiple packets are concatenated
-	// The C++ code handles concatenation and fragmentation. 
-	// Here we assume UDP packets respect boundaries for simplicity, 
-	// but we will loop through the buffer looking for headers.
+func (s *UdpServer) SendConfig(tagID int, cmdID int, data []byte) error {
+	s.mu.Lock()
+	addr, ok := s.lastGw[tagID]
+	s.mu.Unlock()
+
+	if !ok {
+		return fmt.Errorf("gateway for tag %d not found", tagID)
+	}
+
+	// Ideally, we should know the Gateway ID to put in the header.
+	// But we don't track Gateway IDs mapped to IPs yet.
+	// The C++ code uses gwid in PkgingSetTagReq.
+	// If we don't have it, we might use 0 or a dummy.
+	// The Gateway might ignore it or use it.
+	// Let's try to extract GatewayID from incoming packets if possible, but UnibHeader Addr is usually TagID for uplink.
+	// Except for Gateway Heartbeat.
 	
+	// For now, use 0 as gwID.
+	gwID := uint32(0) 
+	
+	pkt := PackageSetTagReq(gwID, uint32(tagID), uint8(cmdID), data)
+	
+	_, err := s.conn.WriteToUDP(pkt, addr)
+	return err
+}
+
+func (s *UdpServer) handlePacket(data []byte, addr *net.UDPAddr, ts int64) {
 	offset := 0
 	for offset < len(data) {
-		// Search for magic
 		if len(data)-offset < UnibHdrLen {
 			break
 		}
 		
-		// Simple scan for magic if not at start (optional, but C++ does it)
-		// For now, assume aligned.
-		
 		hdr, err := ParseHeader(data[offset:])
 		if err != nil {
-			// If invalid magic, maybe skip 1 byte and try again?
-			// C++ FindNextPacketHeader does this.
 			offset++
 			continue
 		}
 
 		totalLen := UnibWrapLen + hdr.BodyLen
 		if offset+totalLen > len(data) {
-			// Truncated packet
 			break
 		}
 
-		// Extract Packet Data
 		pktData := data[offset : offset+totalLen]
 
-		// Write to PCAP if enabled
 		if s.pcap != nil {
-			// We ignore write errors to avoid stalling processing
 			_ = s.pcap.WritePacket(PcapFlag, addr, pktData)
 		}
 
-		// Extract Body
-		// UNIB_WRAP_LEN is 11: Header(9) + CRC(2 at end).
-		// Body starts at offset + 9
 		bodyStart := offset + UnibHdrLen
 		bodyEnd := bodyStart + hdr.BodyLen
 		body := data[bodyStart:bodyEnd]
+		
+		// Update Gateway Map
+		tagID := int(hdr.Addr)
+		s.mu.Lock()
+		s.lastGw[tagID] = addr
+		s.mu.Unlock()
 
-		// Handle Inner Packet
 		s.processInner(hdr, body, ts, 0)
 
 		offset += totalLen
@@ -145,21 +165,13 @@ func (s *UdpServer) handlePacket(data []byte, addr *net.UDPAddr, ts int64) {
 }
 
 func (s *UdpServer) processInner(hdr *UnibHeader, body []byte, ts int64, parentFlags uint8) {
-	// Handle seconds prefix if flag bit 1 is set
-	// C++: bool bSec = pkg->flags & 0x2;
-	// However, Python parser says: sec_flags = pkt.flags | parent_flags
-	// In handlePacket(UnibHeader), we have the flags.
-	
 	combinedFlags := hdr.Flags | parentFlags
 	realBody := body
 	if combinedFlags & 0x2 != 0 && len(body) > 0 {
-		// sec := body[0]
 		realBody = body[1:]
 	}
 
 	tagID := int(hdr.Addr)
-
-	// log.Printf("Packet: Type=%x ID=%x Len=%d", hdr.Type, tagID, len(body))
 
 	switch hdr.Type {
 	case TypeLoraRawDataUp:
@@ -233,18 +245,7 @@ func (s *UdpServer) feedTwr(tagID int, ts int64, samples []TwrSample) {
 			Range:    smp.RangeM,
 		}
 	}
-	// Empty BLE for TWR frame
 	res := s.pipeline.Process(ts, tagID, []fusion.BLEMeas{}, twrMeas, 0.0)
-	
-	/*
-	if res.NumBeacons == 0 && len(samples) > 0 {
-		log.Printf("All anchors filtered! Tag=%x Samples=%d", tagID, len(samples))
-		for _, smp := range samples {
-			log.Printf("  Sample Anc=%x Range=%.2f", smp.AnchorID, smp.RangeM)
-		}
-	}
-	*/
-	
 	s.sendResult(tagID, ts, res)
 }
 
@@ -256,7 +257,6 @@ func (s *UdpServer) feedRssi(tagID int, ts int64, samples []RssiSample) {
 			RSSIDb:   smp.RSSIDb,
 		}
 	}
-	// Empty TWR for RSSI frame
 	res := s.pipeline.Process(ts, tagID, bleMeas, []fusion.TWRMeas{}, 0.0)
 	s.sendResult(tagID, ts, res)
 }
@@ -271,11 +271,7 @@ type wsPos struct {
 }
 
 func (s *UdpServer) sendResult(tagID int, ts int64, res fusion.FusionResult) {
-	// Debug logging
-	if res.Flag >= 1 {
-		// log.Printf("Valid position: ID=%x X=%.2f Y=%.2f", tagID, res.X, res.Y)
-	} else {
-		// log.Printf("Invalid position: ID=%x Flag=%d Algo=%s Beacons=%d", tagID, res.Flag, res.Algo, res.NumBeacons)
+	if res.Flag < 1 {
 		return
 	}
 	
@@ -284,14 +280,11 @@ func (s *UdpServer) sendResult(tagID int, ts int64, res fusion.FusionResult) {
 		region = *res.Layer
 	}
 
-	// RBC Format
 	if s.sender != nil {
-		// Z is not returned by FusionResult, assuming 0.0 for now
 		msg := rbc.FormatTagPos(tagID, ts, 0, region, res.X, res.Y, 0.0)
 		s.sender.Send(msg, rbc.FlagPosition)
 	}
 
-	// Web Broadcast
 	if s.webHub != nil {
 		pos := wsPos{
 			ID:    int64(tagID),

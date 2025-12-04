@@ -71,6 +71,7 @@ func main() {
 		// Serve static files from config directory and frontend
 		go webSvr.Start(*httpPort, *webRoot, configDir)
 		udpSvr.SetWebHub(webSvr.Hub)
+		webSvr.SetDownlinkHandler(udpSvr)
 	}
 
 	// Configure RBC

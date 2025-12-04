@@ -135,6 +135,45 @@ function App() {
     return Object.values(tags);
   }, [tags]);
 
+  // Config Form State
+  const [configTagId, setConfigTagId] = useState('');
+  const [configCmdId, setConfigCmdId] = useState('1');
+  const [configData, setConfigData] = useState('');
+
+  const handleSendConfig = async () => {
+    try {
+      const tagIdInt = parseInt(configTagId, 16);
+      const cmdIdInt = parseInt(configCmdId, 10);
+      if (isNaN(tagIdInt)) {
+        alert("Invalid Tag ID (Hex)");
+        return;
+      }
+      if (isNaN(cmdIdInt)) {
+        alert("Invalid Cmd ID");
+        return;
+      }
+      
+      const res = await fetch('/api/lora/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tag_id: tagIdInt,
+          cmd_id: cmdIdInt,
+          data_hex: configData
+        })
+      });
+      
+      if (res.ok) {
+        alert("Config Sent!");
+      } else {
+        const txt = await res.text();
+        alert("Error: " + txt);
+      }
+    } catch (e) {
+      alert("Request Failed: " + e);
+    }
+  };
+
   return (
     <div className="container-fluid vh-100 d-flex flex-column p-0">
       <nav className="navbar navbar-dark bg-dark">
@@ -149,7 +188,7 @@ function App() {
       <div className="row flex-grow-1 g-0">
         <div className="col-md-3 bg-light border-end overflow-auto p-3">
           <h5>Active Tags ({activeTags.length})</h5>
-          <ul className="list-group">
+          <ul className="list-group mb-4">
             {activeTags.map(tag => (
               <li key={tag.id} className="list-group-item d-flex justify-content-between align-items-center">
                 <div>
@@ -163,6 +202,41 @@ function App() {
               </li>
             ))}
           </ul>
+
+          <hr />
+          <h5>Configuration</h5>
+          <div className="mb-3">
+            <label className="form-label">Tag ID (Hex)</label>
+            <input 
+              type="text" 
+              className="form-control" 
+              value={configTagId} 
+              onChange={e => setConfigTagId(e.target.value)} 
+              placeholder="e.g. 1A2B"
+            />
+          </div>
+          <div className="mb-3">
+            <label className="form-label">Cmd ID (Int)</label>
+            <input 
+              type="number" 
+              className="form-control" 
+              value={configCmdId} 
+              onChange={e => setConfigCmdId(e.target.value)} 
+            />
+          </div>
+          <div className="mb-3">
+            <label className="form-label">Data (Hex)</label>
+            <input 
+              type="text" 
+              className="form-control" 
+              value={configData} 
+              onChange={e => setConfigData(e.target.value)} 
+              placeholder="e.g. 010203"
+            />
+          </div>
+          <button className="btn btn-primary w-100" onClick={handleSendConfig}>
+            Send Config
+          </button>
         </div>
         <div className="col-md-9 position-relative" style={{ background: '#eee' }}>
           <Canvas camera={{ position: [40, 60, 40], fov: 50 }}>
