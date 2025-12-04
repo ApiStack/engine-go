@@ -22,6 +22,16 @@ const (
 	PcapFlag = 0x109
 )
 
+type wsPos struct {
+	ID int64 `json:"id"`
+	TS int64 `json:"ts"`
+	X  float64 `json:"x"`
+	Y  float64 `json:"y"`
+	Z  float64 `json:"z"`
+	Layer int `json:"layer"`
+	Flag  int `json:"flag"`
+}
+
 type UdpServer struct {
 	conn     *net.UDPConn
 	pipeline *fusion.FusionPipeline
@@ -32,6 +42,8 @@ type UdpServer struct {
 	
 	// Map TagID -> Last Seen Gateway Addr
 	lastGw map[int]*net.UDPAddr
+	// Map TagID -> Last Known Position
+	tagsState map[int]*wsPos
 	mu     sync.Mutex
 }
 
@@ -55,6 +67,7 @@ func NewUdpServer(port int, pipeline *fusion.FusionPipeline) (*UdpServer, error)
 		conn:     conn,
 		pipeline: pipeline,
 		lastGw:   make(map[int]*net.UDPAddr),
+		tagsState: make(map[int]*wsPos),
 	}, nil
 }
 
@@ -68,6 +81,16 @@ func (s *UdpServer) SetRbcSender(snd *rbc.Sender) {
 
 func (s *UdpServer) SetWebHub(h *web.Hub) {
 	s.webHub = h
+}
+
+func (s *UdpServer) GetTags() interface{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tags := make([]*wsPos, 0, len(s.tagsState))
+	for _, t := range s.tagsState {
+		tags = append(tags, t)
+	}
+	return tags
 }
 
 func (s *UdpServer) Start() {
@@ -204,6 +227,7 @@ func (s *UdpServer) processInner(hdr *UnibHeader, body []byte, ts int64, parentF
 	case TypeTwrFrame:
 		samples, err := ParseTwrFrame(realBody)
 		if err == nil {
+			// log.Printf("TWR Frame: Tag=%x Num=%d", tagID, len(samples))
 			s.feedTwr(tagID, ts, samples)
 		} else {
 			log.Printf("ParseTwrFrame error: %v", err)
@@ -211,6 +235,7 @@ func (s *UdpServer) processInner(hdr *UnibHeader, body []byte, ts int64, parentF
 	case TypeTwrFrameS:
 		samples, err := ParseTwrFrameS(realBody)
 		if err == nil {
+			// log.Printf("TWR_S Frame: Tag=%x Num=%d", tagID, len(samples))
 			s.feedTwr(tagID, ts, samples)
 		} else {
 			log.Printf("ParseTwrFrameS error: %v", err)
@@ -218,6 +243,7 @@ func (s *UdpServer) processInner(hdr *UnibHeader, body []byte, ts int64, parentF
 	case TypeRssiFrame:
 		samples, err := ParseRssiFrame(realBody)
 		if err == nil {
+			// log.Printf("RSSI Frame: Tag=%x Num=%d", tagID, len(samples))
 			s.feedRssi(tagID, ts, samples)
 		} else {
 			log.Printf("ParseRssiFrame error: %v", err)
@@ -225,6 +251,7 @@ func (s *UdpServer) processInner(hdr *UnibHeader, body []byte, ts int64, parentF
 	case TypeRssiFrameS:
 		samples, err := ParseRssiFrameS(realBody)
 		if err == nil {
+			// log.Printf("RSSI_S Frame: Tag=%x Num=%d", tagID, len(samples))
 			s.feedRssi(tagID, ts, samples)
 		} else {
 			log.Printf("ParseRssiFrameS error: %v", err)
@@ -261,18 +288,10 @@ func (s *UdpServer) feedRssi(tagID int, ts int64, samples []RssiSample) {
 	s.sendResult(tagID, ts, res)
 }
 
-type wsPos struct {
-	ID int64 `json:"id"`
-	TS int64 `json:"ts"`
-	X  float64 `json:"x"`
-	Y  float64 `json:"y"`
-	Z  float64 `json:"z"`
-	Layer int `json:"layer"`
-}
-
 func (s *UdpServer) sendResult(tagID int, ts int64, res fusion.FusionResult) {
-	if res.Flag < 1 {
-		return
+	// Debug logging for Replay tracking
+	if res.Flag > 0 && tagID % 10 == 0 {
+		// log.Printf("Pos: ID=%x Flag=%d X=%.2f Y=%.2f", tagID, res.Flag, res.X, res.Y)
 	}
 	
 	region := 0
@@ -280,20 +299,28 @@ func (s *UdpServer) sendResult(tagID int, ts int64, res fusion.FusionResult) {
 		region = *res.Layer
 	}
 
-	if s.sender != nil {
+	// Only send valid positions to RBC
+	if res.Flag >= 1 && s.sender != nil {
 		msg := rbc.FormatTagPos(tagID, ts, 0, region, res.X, res.Y, 0.0)
 		s.sender.Send(msg, rbc.FlagPosition)
 	}
+	
+	pos := &wsPos{
+		ID:    int64(tagID),
+		TS:    ts,
+		X:     res.X,
+		Y:     res.Y,
+		Z:     0.0,
+		Layer: region,
+		Flag:  res.Flag,
+	}
+	
+	// Update State (Always update, even if invalid/predictive)
+	s.mu.Lock()
+	s.tagsState[tagID] = pos
+	s.mu.Unlock()
 
 	if s.webHub != nil {
-		pos := wsPos{
-			ID:    int64(tagID),
-			TS:    ts,
-			X:     res.X,
-			Y:     res.Y,
-			Z:     0.0,
-			Layer: region,
-		}
 		b, _ := json.Marshal(pos)
 		s.webHub.Broadcast(b)
 	}

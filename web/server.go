@@ -14,9 +14,14 @@ type DownlinkHandler interface {
 	SendConfig(tagID int, cmdID int, data []byte) error
 }
 
+type TagProvider interface {
+	GetTags() interface{}
+}
+
 type Server struct {
 	Hub             *Hub
 	DownlinkHandler DownlinkHandler
+	TagProvider     TagProvider
 }
 
 func NewServer() *Server {
@@ -27,6 +32,10 @@ func NewServer() *Server {
 
 func (s *Server) SetDownlinkHandler(h DownlinkHandler) {
 	s.DownlinkHandler = h
+}
+
+func (s *Server) SetTagProvider(p TagProvider) {
+	s.TagProvider = p
 }
 
 func (s *Server) Start(port int, distDir string, configDir string) {
@@ -41,6 +50,7 @@ func (s *Server) Start(port int, distDir string, configDir string) {
 
 	// API
 	mux.HandleFunc("/api/lora/config", s.handleLoraConfig)
+	mux.HandleFunc("/api/tags", s.handleGetTags)
 
 	// Config Files
 	if configDir != "" {
@@ -107,4 +117,15 @@ func (s *Server) handleLoraConfig(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
+}
+
+func (s *Server) handleGetTags(w http.ResponseWriter, r *http.Request) {
+	if s.TagProvider == nil {
+		http.Error(w, "Tag provider not configured", http.StatusServiceUnavailable)
+		return
+	}
+	
+	tags := s.TagProvider.GetTags()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(tags)
 }

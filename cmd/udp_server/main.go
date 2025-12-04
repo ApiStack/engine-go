@@ -29,6 +29,7 @@ func main() {
 	pcapPath := flag.String("pcap", "", "Path to output PCAP file (optional)")
 	replayPath := flag.String("replay", "", "Path to input PCAP file to replay")
 	replaySpeed := flag.Float64("speed", 1.0, "Replay speed multiplier")
+	loopReplay := flag.Bool("loop", false, "Loop replay indefinitely")
 	flag.Parse()
 
 	if _, err := os.Stat(*projectXML); os.IsNotExist(err) {
@@ -72,6 +73,7 @@ func main() {
 		go webSvr.Start(*httpPort, *webRoot, configDir)
 		udpSvr.SetWebHub(webSvr.Hub)
 		webSvr.SetDownlinkHandler(udpSvr)
+		webSvr.SetTagProvider(udpSvr)
 	}
 
 	// Configure RBC
@@ -114,12 +116,22 @@ func main() {
 	// Start Server or Replay
 	if *replayPath != "" {
 		go func() {
-			if err := udpSvr.Replay(*replayPath, *replaySpeed); err != nil {
-				log.Printf("Replay error: %v", err)
+			for {
+				if err := udpSvr.Replay(*replayPath, *replaySpeed); err != nil {
+					log.Printf("Replay error: %v", err)
+					// If error is fatal (e.g. file not found), break to avoid busy loop logs
+					if os.IsNotExist(err) {
+						break
+					}
+				}
+				if !*loopReplay {
+					log.Println("Replay finished.")
+					break
+				}
+				log.Println("Replay finished. Looping...")
+				time.Sleep(1 * time.Second) // Short pause before restart
 			}
-			// Send interrupt to self to exit after replay? 
-			// Or just let it sit idle? Let's exit.
-			syscall.Kill(os.Getpid(), syscall.SIGTERM)
+			// Do not kill process, let HTTP server run
 		}()
 	} else {
 		go udpSvr.Start()

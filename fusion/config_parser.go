@@ -110,7 +110,8 @@ func ParseProjectAnchors(path string) map[int]Anchor {
                 if err1 != nil || err2 != nil || err3 != nil {
                     continue
                 }
-                anchors[int(aid)] = Anchor{ID: int(aid), X: x / 100.0, Y: y / 100.0, Z: z / 100.0, Layer: layer, Building: 0}
+                shortID := int(aid & 0xFFFF)
+                anchors[shortID] = Anchor{ID: shortID, X: x / 100.0, Y: y / 100.0, Z: z / 100.0, Layer: layer, Building: 0}
             }
         case xml.EndElement:
             if t.Name.Local == "anchorlist" {
@@ -169,7 +170,8 @@ func ParseProjectBeacons(path string) map[int]Anchor {
                 if err1 != nil || err2 != nil || err3 != nil {
                     continue
                 }
-                beacons[int(bid)] = Anchor{ID: int(bid), X: x / 100.0, Y: y / 100.0, Z: z / 100.0, Layer: layer, Building: 0}
+                shortID := int(bid & 0xFFFF)
+                beacons[shortID] = Anchor{ID: shortID, X: x / 100.0, Y: y / 100.0, Z: z / 100.0, Layer: layer, Building: 0}
             }
         case xml.EndElement:
             if t.Name.Local == "beaconlist" {

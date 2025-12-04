@@ -2,6 +2,7 @@ package fusion
 
 import (
     "math"
+    "gonum.org/v1/gonum/mat"
 )
 
 // Anchor describes a beacon/anchor position and metadata.
@@ -135,57 +136,67 @@ func RKStatistics(meaSize int, rk []float64, pykk1 [][]float64) [3]float64 {
     return [3]float64{mean, stddev, chi}
 }
 
-// pinv computes pseudo-inverse via Gaussian elimination (simple, small matrices).
+// pinv computes pseudo-inverse via SVD (using Gonum).
 func pinv(a [][]float64) [][]float64 {
-    n := len(a)
-    if n == 0 {
+    r := len(a)
+    if r == 0 {
         return [][]float64{}
     }
-    // build augmented matrix [A | I]
-    aug := make([][]float64, n)
-    for i := 0; i < n; i++ {
-        aug[i] = make([]float64, 2*n)
-        copy(aug[i], a[i])
-        aug[i][n+i] = 1.0
+    c := len(a[0])
+
+    // Flatten input to construct Gonum matrix
+    data := make([]float64, 0, r*c)
+    for _, row := range a {
+        data = append(data, row...)
     }
-    // Gauss-Jordan
-    for i := 0; i < n; i++ {
-        // find pivot
-        pivot := i
-        for j := i + 1; j < n; j++ {
-            if math.Abs(aug[j][i]) > math.Abs(aug[pivot][i]) {
-                pivot = j
-            }
+    A := mat.NewDense(r, c, data)
+
+    // Compute SVD
+    var svd mat.SVD
+    ok := svd.Factorize(A, mat.SVDThin)
+    if !ok {
+        // Should not happen for valid inputs, return zero matrix on failure
+        m := make([][]float64, c)
+        for i := range m {
+            m[i] = make([]float64, r)
         }
-        if math.Abs(aug[pivot][i]) < 1e-12 {
-            continue
-        }
-        // swap
-        aug[i], aug[pivot] = aug[pivot], aug[i]
-        // scale to 1
-        factor := aug[i][i]
-        for k := 0; k < 2*n; k++ {
-            aug[i][k] /= factor
-        }
-        // eliminate others
-        for j := 0; j < n; j++ {
-            if j == i {
-                continue
-            }
-            factor = aug[j][i]
-            if factor == 0 {
-                continue
-            }
-            for k := 0; k < 2*n; k++ {
-                aug[j][k] -= factor * aug[i][k]
-            }
+        return m
+    }
+
+    var u, v mat.Dense
+    svd.UTo(&u)
+    svd.VTo(&v)
+    s := svd.Values(nil)
+
+    // Construct Sigma pseudoinverse
+    // Threshold for singular values
+    maxS := 0.0
+    if len(s) > 0 {
+        maxS = s[0]
+    }
+    // Standard tolerance: eps * max(rows, cols) * max_singular_value
+    tol := 1e-15 * float64(max(r, c)) * maxS
+
+    sigInv := mat.NewDense(len(s), len(s), nil)
+    for i, val := range s {
+        if val > tol {
+            sigInv.Set(i, i, 1.0/val)
         }
     }
-    inv := make([][]float64, n)
-    for i := 0; i < n; i++ {
-        inv[i] = make([]float64, n)
-        copy(inv[i], aug[i][n:])
+
+    // Pseudo-inverse = V * Sigma^+ * U^T
+    var temp mat.Dense
+    temp.Mul(&v, sigInv)
+    var res mat.Dense
+    res.Mul(&temp, u.T())
+
+    // Convert back to [][]float64
+    rows, cols := res.Dims()
+    out := make([][]float64, rows)
+    for i := 0; i < rows; i++ {
+        out[i] = make([]float64, cols)
+        copy(out[i], res.RawRowView(i))
     }
-    return inv
+    return out
 }
 

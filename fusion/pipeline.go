@@ -31,6 +31,7 @@ type FusionPipeline struct {
     rssiModel    *BLERssi
     ekf          *EKF
     lastTS       *int64
+    lastImuDist  *float64
     initialized  bool
     dimMap       map[int][]DimMat
     beaconLayer  map[int]int
@@ -290,7 +291,18 @@ func (p *FusionPipeline) ProcessIMU(tsMs int64, distance float64, yawDeg float64
     if p.lastTS == nil {
         p.lastTS = new(int64)
         *p.lastTS = tsMs
+        p.lastImuDist = new(float64)
+        *p.lastImuDist = distance
+        return
     }
+    if p.lastImuDist == nil {
+        p.lastImuDist = new(float64)
+        *p.lastImuDist = distance
+    }
+    
+    deltaDist := distance - *p.lastImuDist
+    *p.lastImuDist = distance
+    
     if tsMs <= *p.lastTS {
         tsMs = *p.lastTS + 1
     }
@@ -299,6 +311,7 @@ func (p *FusionPipeline) ProcessIMU(tsMs int64, distance float64, yawDeg float64
         p.ekf.resetState()
         p.initialized = false
         *p.lastTS = tsMs
+        *p.lastImuDist = distance // Reset IMU baseline
         return
     }
     p.ekf.Updt(math.Max(dt, 0.01))
@@ -308,8 +321,8 @@ func (p *FusionPipeline) ProcessIMU(tsMs int64, distance float64, yawDeg float64
 
     // apply displacement
     rad := yawDeg * math.Pi / 180.0
-    dx := distance * math.Cos(rad)
-    dy := distance * math.Sin(rad)
+    dx := deltaDist * math.Cos(rad)
+    dy := deltaDist * math.Sin(rad)
     p.ekf.xk[0] += dx
     p.ekf.xk[1] += dy
     if dt > 0.0 {
