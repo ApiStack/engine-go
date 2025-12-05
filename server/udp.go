@@ -1,11 +1,14 @@
 package server
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math"
 	"net"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -31,6 +34,8 @@ type wsPos struct {
 	Z  float64 `json:"z"`
 	Layer int `json:"layer"`
 	Flag  int `json:"flag"`
+	Pressure *float64 `json:"pressure,omitempty"`
+	Temperature *float64 `json:"temperature,omitempty"`
 }
 
 type UdpServer struct {
@@ -41,6 +46,9 @@ type UdpServer struct {
 	webHub   *web.Hub
 	running  bool
 	
+	csvFile   *os.File
+	csvWriter *csv.Writer
+
 	// Map TagID -> Last Seen Gateway Addr
 	lastGw map[int]*net.UDPAddr
 	// Map TagID -> Last Known Position
@@ -69,11 +77,21 @@ func NewUdpServer(port int, pipeline *fusion.FusionPipeline) (*UdpServer, error)
 		pipeline: pipeline,
 		lastGw:   make(map[int]*net.UDPAddr),
 		tagsState: make(map[int]*wsPos),
-	}, nil
+	},	nil
 }
 
 func (s *UdpServer) SetPcapWriter(pw *binlog.PcapWriter) {
 	s.pcap = pw
+}
+
+func (s *UdpServer) SetCSVWriter(path string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	s.csvFile = f
+	s.csvWriter = csv.NewWriter(f)
+	return s.csvWriter.Write([]string{"tag_id", "ts", "x", "y", "z", "layer", "flag"})
 }
 
 func (s *UdpServer) SetRbcSender(snd *rbc.Sender) {
@@ -120,6 +138,10 @@ func (s *UdpServer) Start() {
 func (s *UdpServer) Stop() {
 	s.running = false
 	s.conn.Close()
+	if s.csvWriter != nil {
+		s.csvWriter.Flush()
+		s.csvFile.Close()
+	}
 }
 
 func (s *UdpServer) SendConfig(tagID int, cmdID int, data []byte) error {
@@ -146,6 +168,55 @@ func (s *UdpServer) SendConfig(tagID int, cmdID int, data []byte) error {
 	
 	_, err := s.conn.WriteToUDP(pkt, addr)
 	return err
+}
+
+func (s *UdpServer) handleExd(tagID int, ts int64, extra ExdData) {
+	if extra.Pressure == nil && extra.Temperature == nil {
+		return
+	}
+
+	s.mu.Lock()
+	state, ok := s.tagsState[tagID]
+	
+	var posX, posY float64
+	var layer, flag int
+	
+	newState := &wsPos{
+		ID:   int64(tagID),
+		TS:   ts,
+		Z:    0.0,
+	}
+
+	if ok {
+		posX = state.X
+		posY = state.Y
+		layer = state.Layer
+		flag = state.Flag
+		
+		// Preserve existing values if new ones are missing
+		newState.Pressure = state.Pressure
+		newState.Temperature = state.Temperature
+	}
+	
+	newState.X = posX
+	newState.Y = posY
+	newState.Layer = layer
+	newState.Flag = flag
+	
+	if extra.Pressure != nil {
+		newState.Pressure = extra.Pressure
+	}
+	if extra.Temperature != nil {
+		newState.Temperature = extra.Temperature
+	}
+
+	s.tagsState[tagID] = newState
+	s.mu.Unlock()
+
+	if s.webHub != nil {
+		b, _ := json.Marshal(newState)
+		s.webHub.Broadcast(b)
+	}
 }
 
 func (s *UdpServer) handlePacket(data []byte, addr *net.UDPAddr, ts int64) {
@@ -226,46 +297,54 @@ func (s *UdpServer) processInner(hdr *UnibHeader, body []byte, ts int64, parentF
 		}
 
 	case TypeTwrFrame:
-		samples, err := ParseTwrFrame(realBody)
+		samples, extraBytes, err := ParseTwrFrame(realBody)
 		if err == nil {
-			// log.Printf("TWR Frame: Tag=%x Num=%d", tagID, len(samples))
-			s.feedTwr(tagID, ts, samples)
+			extra := ParseExdEntries(extraBytes)
+			s.feedTwr(tagID, ts, samples, extra)
 		} else {
 			log.Printf("ParseTwrFrame error: %v", err)
 		}
 	case TypeTwrFrameS:
-		samples, err := ParseTwrFrameS(realBody)
+		samples, extraBytes, err := ParseTwrFrameS(realBody)
 		if err == nil {
-			// log.Printf("TWR_S Frame: Tag=%x Num=%d", tagID, len(samples))
-			s.feedTwr(tagID, ts, samples)
+			extra := ParseExdEntries(extraBytes)
+			s.feedTwr(tagID, ts, samples, extra)
 		} else {
 			log.Printf("ParseTwrFrameS error: %v", err)
 		}
 	case TypeRssiFrame:
-		samples, err := ParseRssiFrame(realBody)
+		samples, extraBytes, err := ParseRssiFrame(realBody)
 		if err == nil {
-			// log.Printf("RSSI Frame: Tag=%x Num=%d", tagID, len(samples))
-			s.feedRssi(tagID, ts, samples)
+			extra := ParseExdEntries(extraBytes)
+			s.feedRssi(tagID, ts, samples, extra)
 		} else {
 			log.Printf("ParseRssiFrame error: %v", err)
 		}
 	case TypeRssiFrameS:
-		samples, err := ParseRssiFrameS(realBody)
+		samples, extraBytes, err := ParseRssiFrameS(realBody)
 		if err == nil {
-			// log.Printf("RSSI_S Frame: Tag=%x Num=%d", tagID, len(samples))
-			s.feedRssi(tagID, ts, samples)
+			extra := ParseExdEntries(extraBytes)
+			s.feedRssi(tagID, ts, samples, extra)
 		} else {
 			log.Printf("ParseRssiFrameS error: %v", err)
 		}
 	case TypeImuFrame:
-		imu, err := ParseImuFrame(realBody)
+		imu, extraBytes, err := ParseImuFrame(realBody)
 		if err == nil {
 			s.pipeline.ProcessIMU(ts, imu.DistanceM, imu.YawDeg)
+			
+			extra := ParseExdEntries(extraBytes)
+			if extra.Pressure != nil || extra.Temperature != nil {
+				s.handleExd(tagID, ts, extra)
+			}
 		}
+	case TypeUpExd:
+		extra := ParseExdEntries(realBody)
+		s.handleExd(tagID, ts, extra)
 	}
 }
 
-func (s *UdpServer) feedTwr(tagID int, ts int64, samples []TwrSample) {
+func (s *UdpServer) feedTwr(tagID int, ts int64, samples []TwrSample, extra ExdData) {
 	twrMeas := make([]fusion.TWRMeas, len(samples))
 	for i, smp := range samples {
 		twrMeas[i] = fusion.TWRMeas{
@@ -274,10 +353,10 @@ func (s *UdpServer) feedTwr(tagID int, ts int64, samples []TwrSample) {
 		}
 	}
 	res := s.pipeline.Process(ts, tagID, []fusion.BLEMeas{}, twrMeas, 0.0)
-	s.sendResult(tagID, ts, res)
+	s.sendResult(tagID, ts, res, extra)
 }
 
-func (s *UdpServer) feedRssi(tagID int, ts int64, samples []RssiSample) {
+func (s *UdpServer) feedRssi(tagID int, ts int64, samples []RssiSample, extra ExdData) {
 	bleMeas := make([]fusion.BLEMeas, len(samples))
 	for i, smp := range samples {
 		bleMeas[i] = fusion.BLEMeas{
@@ -286,10 +365,10 @@ func (s *UdpServer) feedRssi(tagID int, ts int64, samples []RssiSample) {
 		}
 	}
 	res := s.pipeline.Process(ts, tagID, bleMeas, []fusion.TWRMeas{}, 0.0)
-	s.sendResult(tagID, ts, res)
+	s.sendResult(tagID, ts, res, extra)
 }
 
-func (s *UdpServer) sendResult(tagID int, ts int64, res fusion.FusionResult) {
+func (s *UdpServer) sendResult(tagID int, ts int64, res fusion.FusionResult, extra ExdData) {
 	// Debug logging for large coordinates
 	if math.Abs(res.X) > 1000.0 || math.Abs(res.Y) > 1000.0 {
 		log.Printf("WARNING: Large Coordinate detected! Tag=%x X=%.2f Y=%.2f", tagID, res.X, res.Y)
@@ -310,6 +389,19 @@ func (s *UdpServer) sendResult(tagID int, ts int64, res fusion.FusionResult) {
 		msg := rbc.FormatTagPos(tagID, ts, 0, region, res.X, res.Y, 0.0)
 		s.sender.Send(msg, rbc.FlagPosition)
 	}
+
+	if s.csvWriter != nil {
+		s.csvWriter.Write([]string{
+			fmt.Sprintf("%X", tagID),
+			strconv.FormatInt(ts, 10),
+			fmt.Sprintf("%.4f", res.X),
+			fmt.Sprintf("%.4f", res.Y),
+			"0.0",
+			strconv.Itoa(region),
+			strconv.Itoa(res.Flag),
+		})
+		s.csvWriter.Flush()
+	}
 	
 	pos := &wsPos{
 		ID:    int64(tagID),
@@ -319,10 +411,20 @@ func (s *UdpServer) sendResult(tagID int, ts int64, res fusion.FusionResult) {
 		Z:     0.0,
 		Layer: region,
 		Flag:  res.Flag,
+		Pressure: extra.Pressure,
+		Temperature: extra.Temperature,
 	}
 	
 	// Update State (Always update, even if invalid/predictive)
 	s.mu.Lock()
+	if oldState, ok := s.tagsState[tagID]; ok {
+		if pos.Pressure == nil {
+			pos.Pressure = oldState.Pressure
+		}
+		if pos.Temperature == nil {
+			pos.Temperature = oldState.Temperature
+		}
+	}
 	s.tagsState[tagID] = pos
 	s.mu.Unlock()
 

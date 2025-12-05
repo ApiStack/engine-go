@@ -19,6 +19,9 @@ const (
 	TypeImuFrame   = 0x90
 	
 	TypeLoraSetDevReq = 0x44
+
+	TypeExdBaroTemp = 0x8C
+	TypeUpExd = 0x21
 )
 
 type UnibHeader struct {
@@ -48,6 +51,11 @@ type RssiSample struct {
 type ImuData struct {
 	DistanceM float64
 	YawDeg    float64
+}
+
+type ExdData struct {
+	Pressure    *float64 // Pascals
+	Temperature *float64 // Celsius
 }
 
 var crc16CcittTable = [256]uint16{
@@ -91,6 +99,38 @@ func Crc16Ccitt(data []byte) uint16 {
 		crc = (crc << 8) ^ crc16CcittTable[(crc>>8)^uint16(b)]
 	}
 	return crc
+}
+
+func ParseExdEntries(data []byte) ExdData {
+	res := ExdData{}
+	offset := 0
+	for offset+2 <= len(data) {
+		etype := data[offset]
+		length := int(data[offset+1])
+		offset += 2
+		if offset+length > len(data) {
+			break
+		}
+		chunk := data[offset : offset+length]
+		
+		if etype == TypeExdBaroTemp && len(chunk) >= 5 {
+			// Pressure: 24-bit little endian
+			pVal := uint32(chunk[0]) | (uint32(chunk[1]) << 8) | (uint32(chunk[2]) << 16)
+			// Temp: 16-bit little endian
+			tVal := int16(uint16(chunk[3]) | (uint16(chunk[4]) << 8))
+			
+			if pVal != 0xFFFFFF {
+				p := float64(pVal)
+				res.Pressure = &p
+			}
+			if tVal != -32768 {
+				t := float64(tVal) / 100.0
+				res.Temperature = &t
+			}
+		}
+		offset += length
+	}
+	return res
 }
 
 func PackageHeader(buf []byte, typ uint16, addr uint32, bodyLen int) {
@@ -196,9 +236,9 @@ func ParseHeader(data []byte) (*UnibHeader, error) {
 	}, nil
 }
 
-func ParseTwrFrame(body []byte) ([]TwrSample, error) {
+func ParseTwrFrame(body []byte) ([]TwrSample, []byte, error) {
 	if len(body) < 2 {
-		return nil, fmt.Errorf("twr frame too short")
+		return nil, nil, fmt.Errorf("twr frame too short")
 	}
 	// seq := body[0]
 	meta := body[1]
@@ -208,7 +248,7 @@ func ParseTwrFrame(body []byte) ([]TwrSample, error) {
 	samples := make([]TwrSample, 0, num)
 	for i := 0; i < num; i++ {
 		if base+5 > len(body) {
-			return nil, fmt.Errorf("twr sample truncated")
+			return nil, nil, fmt.Errorf("twr sample truncated")
 		}
 		addrLow := binary.LittleEndian.Uint16(body[base : base+2])
 		addrHi := uint32(body[base+2])
@@ -221,12 +261,12 @@ func ParseTwrFrame(body []byte) ([]TwrSample, error) {
 			RangeM:   float64(rngRaw) / 100.0,
 		})
 	}
-	return samples, nil
+	return samples, body[base:], nil
 }
 
-func ParseTwrFrameS(body []byte) ([]TwrSample, error) {
+func ParseTwrFrameS(body []byte) ([]TwrSample, []byte, error) {
 	if len(body) < 2 {
-		return nil, fmt.Errorf("twr_s frame too short")
+		return nil, nil, fmt.Errorf("twr_s frame too short")
 	}
 	// seq := body[0]
 	meta := body[1]
@@ -236,7 +276,7 @@ func ParseTwrFrameS(body []byte) ([]TwrSample, error) {
 	samples := make([]TwrSample, 0, num)
 	for i := 0; i < num; i++ {
 		if base+4 > len(body) {
-			return nil, fmt.Errorf("twr_s sample truncated")
+			return nil, nil, fmt.Errorf("twr_s sample truncated")
 		}
 		addr := binary.LittleEndian.Uint16(body[base : base+2])
 		rngRaw := binary.LittleEndian.Uint16(body[base+2 : base+4])
@@ -247,12 +287,12 @@ func ParseTwrFrameS(body []byte) ([]TwrSample, error) {
 			RangeM:   float64(rngRaw) / 100.0,
 		})
 	}
-	return samples, nil
+	return samples, body[base:], nil
 }
 
-func ParseRssiFrame(body []byte) ([]RssiSample, error) {
+func ParseRssiFrame(body []byte) ([]RssiSample, []byte, error) {
 	if len(body) < 2 {
-		return nil, fmt.Errorf("rssi frame too short")
+		return nil, nil, fmt.Errorf("rssi frame too short")
 	}
 	meta := body[1]
 	num := int(meta >> 4)
@@ -266,7 +306,7 @@ func ParseRssiFrame(body []byte) ([]RssiSample, error) {
 
 	for i := 0; i < num; i++ {
 		if base+4 > len(body) {
-			return nil, fmt.Errorf("rssi sample truncated")
+			return nil, nil, fmt.Errorf("rssi sample truncated")
 		}
 		addrLow := binary.LittleEndian.Uint16(body[base : base+2])
 		addrHi := uint32(body[base+2])
@@ -279,12 +319,12 @@ func ParseRssiFrame(body []byte) ([]RssiSample, error) {
 			RSSIDb:   int(rssi),
 		})
 	}
-	return samples, nil
+	return samples, body[base:], nil
 }
 
-func ParseRssiFrameS(body []byte) ([]RssiSample, error) {
+func ParseRssiFrameS(body []byte) ([]RssiSample, []byte, error) {
 	if len(body) < 2 {
-		return nil, fmt.Errorf("rssi_s frame too short")
+		return nil, nil, fmt.Errorf("rssi_s frame too short")
 	}
 	meta := body[1]
 	num := int(meta >> 4)
@@ -293,7 +333,7 @@ func ParseRssiFrameS(body []byte) ([]RssiSample, error) {
 	samples := make([]RssiSample, 0, num)
 	for i := 0; i < num; i++ {
 		if base+3 > len(body) {
-			return nil, fmt.Errorf("rssi_s sample truncated")
+			return nil, nil, fmt.Errorf("rssi_s sample truncated")
 		}
 		addr := binary.LittleEndian.Uint16(body[base : base+2])
 		rssi := int8(body[base+2])
@@ -304,18 +344,18 @@ func ParseRssiFrameS(body []byte) ([]RssiSample, error) {
 			RSSIDb:   int(rssi),
 		})
 	}
-	return samples, nil
+	return samples, body[base:], nil
 }
 
-func ParseImuFrame(body []byte) (*ImuData, error) {
+func ParseImuFrame(body []byte) (*ImuData, []byte, error) {
 	if len(body) < 11 {
-		return nil, fmt.Errorf("imu frame too short")
+		return nil, nil, fmt.Errorf("imu frame too short")
 	}
 	
 	var distance float32
 	buf := bytes.NewReader(body[1:5])
 	if err := binary.Read(buf, binary.LittleEndian, &distance); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	word1 := binary.LittleEndian.Uint32(body[5:9])
@@ -325,5 +365,5 @@ func ParseImuFrame(body []byte) (*ImuData, error) {
 	return &ImuData{
 		DistanceM: float64(distance),
 		YawDeg:    yawDeg,
-	}, nil
+	}, body[11:], nil
 }

@@ -114,7 +114,7 @@ func (p *FusionPipeline) chooseLayer(bleMeas []BLEMeas, twrMeas []TWRMeas, curre
     return layer
 }
 
-func (p *FusionPipeline) buildSample(tsMs int64, tagID int, bleMeas []BLEMeas, twrMeas []TWRMeas, tagHeight float64, layerSel *int) (*EKFSample, []DimMat) {
+func (p *FusionPipeline) buildSample(tsMs int64, tagID int, bleMeas []BLEMeas, twrMeas []TWRMeas, tagHeight float64, layerSel *int, currentPos [2]float64, initialized bool) (*EKFSample, []DimMat) {
     bleRows := []BLERow{}
     bleEstRanges := []float64{}
     for _, m := range bleMeas {
@@ -135,9 +135,20 @@ func (p *FusionPipeline) buildSample(tsMs int64, tagID int, bleMeas []BLEMeas, t
         if !ok {
             continue
         }
-        if m.Range < 0.01 || m.Range > 600.0 {
+        if m.Range < 0.01 || m.Range > 400.0 {
             continue
         }
+        
+        // Sanity Check / Gating
+        if initialized {
+            dist := math.Hypot(a.X-currentPos[0], a.Y-currentPos[1])
+            // If measured range differs significantly from expected distance, reject it.
+            // Threshold: 50m (allows for fast movement/recovery, but rejects massive outliers)
+            if math.Abs(m.Range-dist) > 50.0 {
+                continue
+            }
+        }
+
         if len(bleEstRanges) > 0 {
             minBle := bleEstRanges[0]
             for _, v := range bleEstRanges[1:] {
@@ -230,7 +241,7 @@ func (p *FusionPipeline) Process(tsMs int64, tagID int, bleMeas []BLEMeas, twrMe
     }
 
     layerSel := p.chooseLayer(bleMeas, twrMeas, currentPos)
-    sample, dimUsed := p.buildSample(tsMs, tagID, bleMeas, twrMeas, tagHeight, layerSel)
+    sample, dimUsed := p.buildSample(tsMs, tagID, bleMeas, twrMeas, tagHeight, layerSel, currentPos, p.initialized)
 
     if !p.initialized && (len(sample.TWR) > 0 || len(sample.BLE) > 0) {
         if len(sample.BLE) > 0 {
@@ -276,8 +287,9 @@ func (p *FusionPipeline) Process(tsMs int64, tagID int, bleMeas []BLEMeas, twrMe
     *p.lastTS = tsMs
     flag := p.ekf.ret
 
-    // Watchdog: If state explodes (e.g. > 2000m), reset immediately
-    if math.Abs(p.ekf.xk[0]) > 2000.0 || math.Abs(p.ekf.xk[1]) > 2000.0 {
+    // Watchdog: If state covariance explodes (Sigma > 100m), reset
+    // This allows large coordinates but catches filter divergence.
+    if p.ekf.Pxk[0][0] > 10000.0 || p.ekf.Pxk[1][1] > 10000.0 {
         p.ekf.resetState()
         p.initialized = false
         p.divergeCount = 0
@@ -347,6 +359,8 @@ func (p *FusionPipeline) Process(tsMs int64, tagID int, bleMeas []BLEMeas, twrMe
             dist := math.Hypot(lX - p.ekf.xk[0], lY - p.ekf.xk[1])
             if dist > 20.0 {
                 // Divergence detected! Trust EKF.
+                // Log for debugging
+                // log.Printf("Divergence: EKF(%.1f, %.1f) Loose(%.1f, %.1f) Dist=%.1f", p.ekf.xk[0], p.ekf.xk[1], lX, lY, dist)
                 outX, outY = p.ekf.xk[0], p.ekf.xk[1]
                 // Reset LooseFusor to snap it back
                 p.looseFusor = loose.NewFusor(loose.DefaultConfig())
@@ -359,6 +373,16 @@ func (p *FusionPipeline) Process(tsMs int64, tagID int, bleMeas []BLEMeas, twrMe
                 outX, outY = lX, lY
             }
         }
+    }
+
+    // Final Watchdog on Output
+    if math.IsNaN(outX) || math.IsNaN(outY) {
+         p.ekf.resetState()
+         p.initialized = false
+         p.divergeCount = 0
+         // Reset LooseFusor too
+         p.looseFusor = loose.NewFusor(loose.DefaultConfig())
+         return FusionResult{TimestampMs: tsMs, X: 0, Y: 0, Flag: -2, UsedMea: [2]int{0, 0}, NumBeacons: 0, Algo: "NA", Layer: layerSel}
     }
 
     return FusionResult{
@@ -443,8 +467,8 @@ func (p *FusionPipeline) ProcessIMU(tsMs int64, distance float64, yawDeg float64
     p.ekf.xk[0] = clamp(p.ekf.xk[0], p.ekf.xMin[0], p.ekf.xMax[0])
     p.ekf.xk[1] = clamp(p.ekf.xk[1], p.ekf.xMin[1], p.ekf.xMax[1])
 
-    // Watchdog: If state explodes (e.g. > 2000m), reset immediately
-    if math.Abs(p.ekf.xk[0]) > 2000.0 || math.Abs(p.ekf.xk[1]) > 2000.0 {
+    // Watchdog: If state covariance explodes (Sigma > 100m), reset
+    if p.ekf.Pxk[0][0] > 10000.0 || p.ekf.Pxk[1][1] > 10000.0 {
         p.ekf.resetState()
         p.initialized = false
         p.divergeCount = 0

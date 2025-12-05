@@ -94,13 +94,7 @@ The server can run in **Live Mode** (listening for UDP packets) or **Replay Mode
 This command runs the replay at 4x speed and serves the frontend interface, continuously looping the PCAP file.
 
 ```bash
-./udp_server \
-  -project ../ruigao/project.xml -wogi ../ruigao/wogi.xml \
-  -http 8080 \
-  -web-root frontend/dist \
-  -replay ../binlog/PKTSBIN_20251204103122343_1105_1121.pcap \
-  -speed 4.0 \
-  -loop
+
 ```
 
 **3. Record Live Traffic:**
