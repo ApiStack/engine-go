@@ -8,6 +8,8 @@ import (
 	"net"
 	"os"
 	"time"
+
+	"engine-go/fusion"
 )
 
 const (
@@ -19,6 +21,38 @@ const (
 	flagTag    = 0x08
 	flagStats  = 0x10
 )
+
+func (s *UdpServer) parseAnchorBlock(payload []byte, itemnum int, itemsize int) {
+	for i := 0; i < itemnum; i++ {
+		start := i * itemsize
+		end := start + itemsize
+		if end > len(payload) {
+			return
+		}
+		chunk := payload[start:end]
+		anchorID := binary.LittleEndian.Uint64(chunk[0:8])
+		x := int32(binary.LittleEndian.Uint32(chunk[8:12]))
+		y := int32(binary.LittleEndian.Uint32(chunk[12:16]))
+		z := int32(binary.LittleEndian.Uint32(chunk[16:20]))
+		region := binary.LittleEndian.Uint16(chunk[20:22])
+
+		// Truncate to Short ID to match map keys and server logic
+		shortID := int(anchorID & 0xFFFF)
+
+		a := fusion.Anchor{
+			ID:       shortID,
+			X:        float64(x) / 100.0,
+			Y:        float64(y) / 100.0,
+			Z:        float64(z) / 100.0,
+			Layer:    int(region),
+			Building: 0,
+		}
+		if !s.pipeline.HasAnchor(shortID) {
+			s.pipeline.AddAnchor(a)
+			// log.Printf("Added Replay Anchor: %x (Full: %x) Pos: %.2f, %.2f, %.2f", shortID, anchorID, a.X, a.Y, a.Z)
+		}
+	}
+}
 
 func (s *UdpServer) Replay(path string, speed float64) error {
 	f, err := os.Open(path)
@@ -81,8 +115,12 @@ func (s *UdpServer) Replay(path string, speed float64) error {
 			return fmt.Errorf("read payload: %w", err)
 		}
 
-		// Skip metadata blocks
-		if flag == flagAnchor || flag == flagTag || flag == flagStats {
+		// Process metadata blocks
+		if flag == flagAnchor {
+			s.parseAnchorBlock(payload, int(port), int(binary.LittleEndian.Uint32(ipBytes)))
+			continue
+		}
+		if flag == flagTag || flag == flagStats {
 			continue
 		}
 		

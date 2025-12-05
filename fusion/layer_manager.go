@@ -484,6 +484,7 @@ func (lm *LayerManager) GetLayer(bleMeas []BLEMeas, twrMeas []TWRMeas, pos [3]fl
         }
     }
     if len(layerList) == 0 {
+        // No known anchors in this frame, cannot determine layer.
         return nil
     }
 
@@ -493,7 +494,10 @@ func (lm *LayerManager) GetLayer(bleMeas []BLEMeas, twrMeas []TWRMeas, pos [3]fl
             continue
         }
         lyr, ok := lm.layers[lid]
-        if !ok || lyr.ProjectIdx < 0 || lyr.ProjectIdx >= len(lm.projects) {
+        if !ok {
+             continue
+        }
+        if lyr.ProjectIdx < 0 || lyr.ProjectIdx >= len(lm.projects) {
             continue
         }
         proj := lm.projects[lyr.ProjectIdx]

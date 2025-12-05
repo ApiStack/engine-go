@@ -3,6 +3,8 @@ package fusion
 import (
     "math"
     "sort"
+
+    "engine-go/fusion/loose"
 )
 
 type BLEMeas struct {
@@ -37,18 +39,40 @@ type FusionPipeline struct {
     beaconLayer  map[int]int
     beaconDims   map[int][]DimMat
     layerManager *LayerManager
+    divergeCount int
+    looseFusor   *loose.Fusor
 }
 
 func NewFusionPipeline(anchors map[int]Anchor, rssi *BLERssi, dimMap map[int][]DimMat, beaconLayer map[int]int, beaconDims map[int][]DimMat, lm *LayerManager) *FusionPipeline {
-    return &FusionPipeline{
-        anchors:      anchors,
-        rssiModel:    rssi,
-        ekf:          NewEKF(),
-        dimMap:       dimMap,
-        beaconLayer:  beaconLayer,
-        beaconDims:   beaconDims,
-        layerManager: lm,
-    }
+	// Ensure Short ID aliases exist for lookups
+	for id, a := range anchors {
+		short := id & 0xFFFF
+		if _, ok := anchors[short]; !ok {
+			alias := a
+			alias.ID = short
+			anchors[short] = alias
+		}
+	}
+	return &FusionPipeline{
+		anchors:      anchors,
+		rssiModel:    rssi,
+		ekf:          NewEKF(),
+		dimMap:       dimMap,
+		beaconLayer:  beaconLayer,
+		beaconDims:   beaconDims,
+		layerManager: lm,
+        divergeCount: 0,
+        looseFusor:   loose.NewFusor(loose.DefaultConfig()),
+	}
+}
+
+func (p *FusionPipeline) AddAnchor(a Anchor) {
+	p.anchors[a.ID] = a
+}
+
+func (p *FusionPipeline) HasAnchor(id int) bool {
+	_, ok := p.anchors[id]
+	return ok
 }
 
 func (p *FusionPipeline) chooseLayer(bleMeas []BLEMeas, twrMeas []TWRMeas, currentPos [2]float64) *int {
@@ -231,6 +255,7 @@ func (p *FusionPipeline) Process(tsMs int64, tagID int, bleMeas []BLEMeas, twrMe
             p.ekf.xk[1] = meanY + 1.0
         }
         p.initialized = true
+        p.divergeCount = 0
     }
 
     if tsMs <= *p.lastTS {
@@ -241,6 +266,7 @@ func (p *FusionPipeline) Process(tsMs int64, tagID int, bleMeas []BLEMeas, twrMe
         p.ekf.resetState()
         p.initialized = false
         *p.lastTS = tsMs
+        p.divergeCount = 0
         return FusionResult{TimestampMs: tsMs, X: 0, Y: 0, Flag: -2, UsedMea: [2]int{0, 0}, NumBeacons: 0, Algo: "NA", Layer: layerSel}
     }
 
@@ -250,8 +276,41 @@ func (p *FusionPipeline) Process(tsMs int64, tagID int, bleMeas []BLEMeas, twrMe
     *p.lastTS = tsMs
     flag := p.ekf.ret
 
+    // Watchdog: If state explodes (e.g. > 2000m), reset immediately
+    if math.Abs(p.ekf.xk[0]) > 2000.0 || math.Abs(p.ekf.xk[1]) > 2000.0 {
+        p.ekf.resetState()
+        p.initialized = false
+        p.divergeCount = 0
+        return FusionResult{TimestampMs: tsMs, X: 0, Y: 0, Flag: -2, UsedMea: [2]int{0, 0}, NumBeacons: 0, Algo: "NA", Layer: layerSel}
+    }
+
+    // Check for divergence/rejection
+    if flag == -3 {
+        p.divergeCount++
+        if p.divergeCount > 5 {
+            p.ekf.resetState()
+            p.initialized = false
+            p.divergeCount = 0
+            // Return reset flag
+            return FusionResult{TimestampMs: tsMs, X: 0, Y: 0, Flag: -2, UsedMea: [2]int{0, 0}, NumBeacons: 0, Algo: "NA", Layer: layerSel}
+        }
+    } else if flag >= 0 {
+        p.divergeCount = 0
+    }
+
     if flag == 1 {
         p.ekf.PredictConstrain()
+    }
+
+    // Feed valid EKF positions to LooseFusor as "UWB Fixes"
+    // This allows LooseFusor to benefit from the geometry solver of EKF
+    tsSec := float64(tsMs) / 1000.0
+    if flag == 2 { // 2 = Measurement Updated
+        uwbFix := loose.UwbFix{X: p.ekf.xk[0], Y: p.ekf.xk[1]}
+        p.looseFusor.IngestBatch(loose.SensorBatch{
+            Timestamp: tsSec,
+            Uwb:       &uwbFix,
+        })
     }
 
     if p.layerManager != nil {
@@ -273,10 +332,39 @@ func (p *FusionPipeline) Process(tsMs int64, tagID int, bleMeas []BLEMeas, twrMe
     }
 
     used := [2]int{p.ekf.usedMea[0], p.ekf.usedMea[1]}
+    
+    // Use LooseFusor output if available
+    outX, outY := p.ekf.xk[0], p.ekf.xk[1]
+    var looseEst loose.Estimate
+    if p.looseFusor.Latest(&looseEst) {
+        // Use raw or smoothed? Smoothed might lag.
+        // Use Raw for now to be responsive.
+        if !math.IsNaN(looseEst.RawX) {
+            lX, lY := looseEst.RawX, looseEst.RawY
+            
+            // Divergence Check: If LooseFusor drifts too far from EKF (Ground Truth),
+            // snap back to EKF and reset LooseFusor.
+            dist := math.Hypot(lX - p.ekf.xk[0], lY - p.ekf.xk[1])
+            if dist > 20.0 {
+                // Divergence detected! Trust EKF.
+                outX, outY = p.ekf.xk[0], p.ekf.xk[1]
+                // Reset LooseFusor to snap it back
+                p.looseFusor = loose.NewFusor(loose.DefaultConfig())
+                // Seed new fusor with current EKF state
+                p.looseFusor.IngestBatch(loose.SensorBatch{
+                    Timestamp: tsSec,
+                    Uwb:       &loose.UwbFix{X: outX, Y: outY},
+                })
+            } else {
+                outX, outY = lX, lY
+            }
+        }
+    }
+
     return FusionResult{
         TimestampMs: tsMs,
-        X:           p.ekf.xk[0],
-        Y:           p.ekf.xk[1],
+        X:           outX,
+        Y:           outY,
         Flag:        flag,
         UsedMea:     used,
         NumBeacons:  len(sample.BLE) + len(sample.TWR),
@@ -312,8 +400,33 @@ func (p *FusionPipeline) ProcessIMU(tsMs int64, distance float64, yawDeg float64
         p.initialized = false
         *p.lastTS = tsMs
         *p.lastImuDist = distance // Reset IMU baseline
+        p.divergeCount = 0
         return
     }
+
+    // Sanity check: Ignore unrealistic jumps (e.g. > 20m/s or > 5m absolute step)
+    // This prevents IMU glitches from diverging the filter.
+    // Check BEFORE feeding to LooseFusor.
+    if math.Abs(deltaDist) > 5.0 || (dt > 0 && math.Abs(deltaDist)/dt > 20.0) {
+        return
+    }
+
+    // Feed IMU to LooseFusor
+    // Note: LooseFusor handles integration internally.
+    tsSec := float64(tsMs) / 1000.0
+    imuRep := loose.ImuReport{
+        YawDeg:       yawDeg,
+        SpeedMps:     0, // Not provided, derived
+        ForwardDisM:  distance,
+        MotionCode:   1, // Assume moving if receiving IMU
+        YawSigmaCode: 0,
+        DsSigmaCode:  0,
+    }
+    p.looseFusor.IngestBatch(loose.SensorBatch{
+        Timestamp: tsSec,
+        Imu:       &imuRep,
+    })
+
     p.ekf.Updt(math.Max(dt, 0.01))
     // predict state (no measurements)
     p.ekf.xk = matVec(p.ekf.Phikk1, p.ekf.xk)
@@ -325,6 +438,19 @@ func (p *FusionPipeline) ProcessIMU(tsMs int64, distance float64, yawDeg float64
     dy := deltaDist * math.Sin(rad)
     p.ekf.xk[0] += dx
     p.ekf.xk[1] += dy
+    
+    // Clamp IMU dead-reckoning
+    p.ekf.xk[0] = clamp(p.ekf.xk[0], p.ekf.xMin[0], p.ekf.xMax[0])
+    p.ekf.xk[1] = clamp(p.ekf.xk[1], p.ekf.xMin[1], p.ekf.xMax[1])
+
+    // Watchdog: If state explodes (e.g. > 2000m), reset immediately
+    if math.Abs(p.ekf.xk[0]) > 2000.0 || math.Abs(p.ekf.xk[1]) > 2000.0 {
+        p.ekf.resetState()
+        p.initialized = false
+        p.divergeCount = 0
+        return
+    }
+
     if dt > 0.0 {
         vx := dx / dt
         vy := dy / dt
@@ -339,5 +465,6 @@ func (p *FusionPipeline) ProcessIMU(tsMs int64, distance float64, yawDeg float64
         p.ekf.xk[3] = vy
     }
     *p.lastTS = tsMs
-    p.initialized = true
+    // Do NOT set p.initialized = true here.
+    // IMU is relative. We need TWR/BLE to establish absolute position.
 }

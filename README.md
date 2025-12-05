@@ -95,11 +95,10 @@ This command runs the replay at 4x speed and serves the frontend interface, cont
 
 ```bash
 ./udp_server \
-  -project ../aox_log/project.xml \
-  -wogi ../aox_log/wogi.xml \
+  -project ../ruigao/project.xml -wogi ../ruigao/wogi.xml \
   -http 8080 \
   -web-root frontend/dist \
-  -replay ../aox_log/PKTSBIN_faraway.pcap \
+  -replay ../binlog/PKTSBIN_20251204103122343_1105_1121.pcap \
   -speed 4.0 \
   -loop
 ```

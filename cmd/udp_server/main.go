@@ -27,6 +27,7 @@ func main() {
 	signalAdjust := flag.Float64("signal-adjust", 8.0, "BLE adjust A at 1m")
 	deployDist := flag.Int("deploy-dist", 800, "Deployment interval cm")
 	pcapPath := flag.String("pcap", "", "Path to output PCAP file (optional)")
+	csvPath := flag.String("csv", "", "Path to output CSV file (optional)")
 	replayPath := flag.String("replay", "", "Path to input PCAP file to replay")
 	replaySpeed := flag.Float64("speed", 1.0, "Replay speed multiplier")
 	loopReplay := flag.Bool("loop", false, "Loop replay indefinitely")
@@ -63,6 +64,12 @@ func main() {
 	udpSvr, err := server.NewUdpServer(*port, pipeline)
 	if err != nil {
 		log.Fatalf("Failed to create UDP server: %v", err)
+	}
+
+	if *csvPath != "" {
+		if err := udpSvr.SetCSVWriter(*csvPath); err != nil {
+			log.Fatalf("Failed to open csv file: %v", err)
+		}
 	}
 
 	// Configure Web Server

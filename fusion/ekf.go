@@ -60,17 +60,20 @@ func NewEKF() *EKF {
     k.adaptive = UseAdaptive
     k.beta = BetaInit
     k.b = BetaB
-    k.xconstrain = []bool{true, true, true, true, true, true}
+    // Match C++: Only constrain Velocity (2,3) and Parameters (4,5).
+    // Position (0,1) is unconstrained to allow large coordinates.
+    // Setting xconstrain to false for pos and using large bounds.
+    k.xconstrain = []bool{false, false, true, true, true, true}
     k.xMin = make([]float64, k.n)
     k.xMax = make([]float64, k.n)
-    k.xMin[0] = -1e5
-    k.xMin[1] = -1e5
+    k.xMin[0] = -1e9 // Effectively no limit
+    k.xMin[1] = -1e9
     k.xMin[2] = -MaxVel
     k.xMin[3] = -MaxVel
     k.xMin[4] = PathLossExp[0]
     k.xMin[5] = DeltaA[0]
-    k.xMax[0] = 1e5
-    k.xMax[1] = 1e5
+    k.xMax[0] = 1e9
+    k.xMax[1] = 1e9
     k.xMax[2] = MaxVel
     k.xMax[3] = MaxVel
     k.xMax[4] = PathLossExp[2]
@@ -325,6 +328,12 @@ func (k *EKF) KfUpdate(sample *EKFSample) {
     }
     k.HMaha = math.Sqrt(tmp)
 
+    // Innovation Gating: Reject strong outliers
+    if k.HMaha > 10.0 {
+        k.ret = -3
+        return
+    }
+
     Kk := matMul(Pxykk1, invPy) // 6 x total
     // update state
     incr := matVec(Kk, k.rk)
@@ -333,7 +342,10 @@ func (k *EKF) KfUpdate(sample *EKFSample) {
     }
     // covariance
     k.Pxk = matSub(Pxkk1, matMul(Kk, matMul(Pykk1, transpose(Kk))))
-    k.Pxk = scalarMat(k.Pxk, k.fading/2.0)
+    // Symmetrize and apply fading: P = (P + P') * (fading / 2)
+    // This ensures P is symmetric and applies the fading factor correctly.
+    // Previous code `scalarMat(k.Pxk, k.fading/2.0)` was INCORRECT as it halved P if fading=1.
+    k.Pxk = scalarMat(matAdd(k.Pxk, transpose(k.Pxk)), k.fading/2.0)
     k.Pykk1 = Pykk1
 
     // update dim constraint health

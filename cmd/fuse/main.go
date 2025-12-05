@@ -156,16 +156,16 @@ func main() {
     }
 
     for _, evt := range parser.Events {
-        bleS, twrS, _ := parser.FilterSamples(evt, uint32(tagID))
+        bleS, twrS, imuS := parser.FilterSamples(evt, uint32(tagID))
         // feed IMU immediately to propagate dead-reckoning
         tsMs := int64(math.Round(evt.Timestamp*1000.0)) + *tsOffset
-        /*
+        
         for _, im := range imuS {
             if im.Distance > 0 {
-                pipeline.ProcessIMU(tsMs, im.Distance, im.YawDeg)
+                pipeline.ProcessIMU(tsMs, float64(im.Distance), float64(im.YawDeg))
             }
         }
-        */
+        
         if len(bleS) == 0 && len(twrS) == 0 {
             continue
         }

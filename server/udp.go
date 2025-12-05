@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"sync"
 	"time"
@@ -268,7 +269,7 @@ func (s *UdpServer) feedTwr(tagID int, ts int64, samples []TwrSample) {
 	twrMeas := make([]fusion.TWRMeas, len(samples))
 	for i, smp := range samples {
 		twrMeas[i] = fusion.TWRMeas{
-			AnchorID: smp.AnchorID,
+			AnchorID: smp.AnchorID & 0xFFFF,
 			Range:    smp.RangeM,
 		}
 	}
@@ -280,7 +281,7 @@ func (s *UdpServer) feedRssi(tagID int, ts int64, samples []RssiSample) {
 	bleMeas := make([]fusion.BLEMeas, len(samples))
 	for i, smp := range samples {
 		bleMeas[i] = fusion.BLEMeas{
-			AnchorID: smp.AnchorID,
+			AnchorID: smp.AnchorID & 0xFFFF,
 			RSSIDb:   smp.RSSIDb,
 		}
 	}
@@ -289,6 +290,11 @@ func (s *UdpServer) feedRssi(tagID int, ts int64, samples []RssiSample) {
 }
 
 func (s *UdpServer) sendResult(tagID int, ts int64, res fusion.FusionResult) {
+	// Debug logging for large coordinates
+	if math.Abs(res.X) > 1000.0 || math.Abs(res.Y) > 1000.0 {
+		log.Printf("WARNING: Large Coordinate detected! Tag=%x X=%.2f Y=%.2f", tagID, res.X, res.Y)
+	}
+
 	// Debug logging for Replay tracking
 	if res.Flag > 0 && tagID % 10 == 0 {
 		// log.Printf("Pos: ID=%x Flag=%d X=%.2f Y=%.2f", tagID, res.Flag, res.X, res.Y)
