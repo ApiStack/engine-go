@@ -47,10 +47,7 @@ func (s *UdpServer) parseAnchorBlock(payload []byte, itemnum int, itemsize int) 
 			Layer:    int(region),
 			Building: 0,
 		}
-		if !s.pipeline.HasAnchor(shortID) {
-			s.pipeline.AddAnchor(a)
-			// log.Printf("Added Replay Anchor: %x (Full: %x) Pos: %.2f, %.2f, %.2f", shortID, anchorID, a.X, a.Y, a.Z)
-		}
+		s.addAnchorGlobal(a)
 	}
 }
 
@@ -75,10 +72,10 @@ func (s *UdpServer) Replay(path string, speed float64) error {
 
 	var firstTs float64
 	var startReal time.Time
-	
+
 	// Initialize real-time start
 	startReal = time.Now()
-	
+
 	pktCount := 0
 
 	for s.running {
@@ -104,11 +101,11 @@ func (s *UdpServer) Replay(path string, speed float64) error {
 		if _, err := io.ReadFull(f, bufPhdr2); err != nil {
 			return fmt.Errorf("read phdr2: %w", err)
 		}
-		
+
 		flag := binary.LittleEndian.Uint16(bufPhdr2[0:2])
 		port := binary.LittleEndian.Uint16(bufPhdr2[2:4])
 		ipBytes := bufPhdr2[4:8]
-		
+
 		payloadLen := int(inclLen) - phdr2Len
 		payload := make([]byte, payloadLen)
 		if _, err := io.ReadFull(f, payload); err != nil {
@@ -123,11 +120,11 @@ func (s *UdpServer) Replay(path string, speed float64) error {
 		if flag == flagTag || flag == flagStats {
 			continue
 		}
-		
+
 		pktCount++
 		if pktCount <= 10 {
-			log.Printf("Replay Pkt #%d: TS=%.3f Len=%d Flag=%x IP=%d.%d.%d.%d:%d", 
-				pktCount, float64(tsSec)+float64(tsUsec)/1e6, payloadLen, flag, 
+			log.Printf("Replay Pkt #%d: TS=%.3f Len=%d Flag=%x IP=%d.%d.%d.%d:%d",
+				pktCount, float64(tsSec)+float64(tsUsec)/1e6, payloadLen, flag,
 				ipBytes[0], ipBytes[1], ipBytes[2], ipBytes[3], port)
 		}
 
@@ -152,10 +149,10 @@ func (s *UdpServer) Replay(path string, speed float64) error {
 
 		// Feed to pipeline
 		s.handlePacket(payload, addr, int64(ts*1000))
-        
-        if pktCount % 1000 == 0 {
-             // log.Printf("Processed %d packets", pktCount)
-        }
+
+		if pktCount%1000 == 0 {
+			// log.Printf("Processed %d packets", pktCount)
+		}
 	}
 	log.Printf("Replay loop ended. Total Packets: %d", pktCount)
 	return nil

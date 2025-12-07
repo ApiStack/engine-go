@@ -19,33 +19,32 @@ import (
 )
 
 const (
-	DefaultPort = 44333
+	DefaultPort   = 44333
 	MaxPacketSize = 65535
-	
+
 	// Flags: RX_PKT(1) | RBB_PKT(8) | PROT_UDP(0x100)
 	PcapFlag = 0x109
 )
 
 type wsPos struct {
-	ID int64 `json:"id"`
-	TS int64 `json:"ts"`
-	X  float64 `json:"x"`
-	Y  float64 `json:"y"`
-	Z  float64 `json:"z"`
-	Layer int `json:"layer"`
-	Flag  int `json:"flag"`
-	Pressure *float64 `json:"pressure,omitempty"`
+	ID          int64    `json:"id"`
+	TS          int64    `json:"ts"`
+	X           float64  `json:"x"`
+	Y           float64  `json:"y"`
+	Z           float64  `json:"z"`
+	Layer       int      `json:"layer"`
+	Flag        int      `json:"flag"`
+	Pressure    *float64 `json:"pressure,omitempty"`
 	Temperature *float64 `json:"temperature,omitempty"`
 }
 
 type UdpServer struct {
-	conn     *net.UDPConn
-	pipeline *fusion.FusionPipeline
-	pcap     *binlog.PcapWriter
-	sender   *rbc.Sender
-	webHub   *web.Hub
-	running  bool
-	
+	conn    *net.UDPConn
+	pcap    *binlog.PcapWriter
+	sender  *rbc.Sender
+	webHub  *web.Hub
+	running bool
+
 	csvFile   *os.File
 	csvWriter *csv.Writer
 
@@ -53,10 +52,20 @@ type UdpServer struct {
 	lastGw map[int]*net.UDPAddr
 	// Map TagID -> Last Known Position
 	tagsState map[int]*wsPos
-	mu     sync.Mutex
+	// Map TagID -> dedicated fusion pipeline (stateful)
+	pipelines map[int]*fusion.FusionPipeline
+
+	// Shared configuration for constructing pipelines
+	anchors      map[int]fusion.Anchor
+	rssiModel    *fusion.BLERssi
+	dimMap       map[int][]fusion.DimMat
+	beaconLayer  map[int]int
+	beaconDims   map[int][]fusion.DimMat
+	layerManager *fusion.LayerManager
+	mu           sync.Mutex
 }
 
-func NewUdpServer(port int, pipeline *fusion.FusionPipeline) (*UdpServer, error) {
+func NewUdpServer(port int, anchors map[int]fusion.Anchor, rssi *fusion.BLERssi, dimMap map[int][]fusion.DimMat, beaconLayer map[int]int, beaconDims map[int][]fusion.DimMat, lm *fusion.LayerManager) (*UdpServer, error) {
 	if port == 0 {
 		port = DefaultPort
 	}
@@ -72,12 +81,23 @@ func NewUdpServer(port int, pipeline *fusion.FusionPipeline) (*UdpServer, error)
 	// Set buffer size similar to C++
 	conn.SetReadBuffer(256 * 1024)
 
+	anchCopy := make(map[int]fusion.Anchor, len(anchors))
+	for k, v := range anchors {
+		anchCopy[k] = v
+	}
+
 	return &UdpServer{
-		conn:     conn,
-		pipeline: pipeline,
-		lastGw:   make(map[int]*net.UDPAddr),
-		tagsState: make(map[int]*wsPos),
-	},	nil
+		conn:         conn,
+		lastGw:       make(map[int]*net.UDPAddr),
+		tagsState:    make(map[int]*wsPos),
+		pipelines:    make(map[int]*fusion.FusionPipeline),
+		anchors:      anchCopy,
+		rssiModel:    rssi,
+		dimMap:       dimMap,
+		beaconLayer:  beaconLayer,
+		beaconDims:   beaconDims,
+		layerManager: lm,
+	}, nil
 }
 
 func (s *UdpServer) SetPcapWriter(pw *binlog.PcapWriter) {
@@ -100,6 +120,16 @@ func (s *UdpServer) SetRbcSender(snd *rbc.Sender) {
 
 func (s *UdpServer) SetWebHub(h *web.Hub) {
 	s.webHub = h
+}
+
+// getPipeline returns a per-tag fusion pipeline, creating one if missing.
+func (s *UdpServer) getPipeline(tagID int) *fusion.FusionPipeline {
+	if p, ok := s.pipelines[tagID]; ok {
+		return p
+	}
+	p := fusion.NewFusionPipeline(s.anchors, s.rssiModel, s.dimMap, s.beaconLayer, s.beaconDims, s.layerManager)
+	s.pipelines[tagID] = p
+	return p
 }
 
 func (s *UdpServer) GetTags() interface{} {
@@ -130,7 +160,7 @@ func (s *UdpServer) Start() {
 		// Make a copy of the data because parsing might slice it
 		data := make([]byte, n)
 		copy(data, buf[:n])
-		
+
 		s.handlePacket(data, addr, time.Now().UnixMilli())
 	}
 }
@@ -160,12 +190,12 @@ func (s *UdpServer) SendConfig(tagID int, cmdID int, data []byte) error {
 	// The Gateway might ignore it or use it.
 	// Let's try to extract GatewayID from incoming packets if possible, but UnibHeader Addr is usually TagID for uplink.
 	// Except for Gateway Heartbeat.
-	
+
 	// For now, use 0 as gwID.
-	gwID := uint32(0) 
-	
+	gwID := uint32(0)
+
 	pkt := PackageSetTagReq(gwID, uint32(tagID), uint8(cmdID), data)
-	
+
 	_, err := s.conn.WriteToUDP(pkt, addr)
 	return err
 }
@@ -177,14 +207,14 @@ func (s *UdpServer) handleExd(tagID int, ts int64, extra ExdData) {
 
 	s.mu.Lock()
 	state, ok := s.tagsState[tagID]
-	
+
 	var posX, posY float64
 	var layer, flag int
-	
+
 	newState := &wsPos{
-		ID:   int64(tagID),
-		TS:   ts,
-		Z:    0.0,
+		ID: int64(tagID),
+		TS: ts,
+		Z:  0.0,
 	}
 
 	if ok {
@@ -192,17 +222,17 @@ func (s *UdpServer) handleExd(tagID int, ts int64, extra ExdData) {
 		posY = state.Y
 		layer = state.Layer
 		flag = state.Flag
-		
+
 		// Preserve existing values if new ones are missing
 		newState.Pressure = state.Pressure
 		newState.Temperature = state.Temperature
 	}
-	
+
 	newState.X = posX
 	newState.Y = posY
 	newState.Layer = layer
 	newState.Flag = flag
-	
+
 	if extra.Pressure != nil {
 		newState.Pressure = extra.Pressure
 	}
@@ -219,13 +249,30 @@ func (s *UdpServer) handleExd(tagID int, ts int64, extra ExdData) {
 	}
 }
 
+// addAnchorGlobal updates the shared anchor store and all live pipelines.
+func (s *UdpServer) addAnchorGlobal(a fusion.Anchor) {
+	// Update shared anchor map
+	if _, exists := s.anchors[a.ID]; !exists {
+		s.anchors[a.ID] = a
+	} else {
+		// overwrite to keep latest coordinates
+		s.anchors[a.ID] = a
+	}
+	// Push into every active pipeline
+	for _, p := range s.pipelines {
+		if !p.HasAnchor(a.ID) {
+			p.AddAnchor(a)
+		}
+	}
+}
+
 func (s *UdpServer) handlePacket(data []byte, addr *net.UDPAddr, ts int64) {
 	offset := 0
 	for offset < len(data) {
 		if len(data)-offset < UnibHdrLen {
 			break
 		}
-		
+
 		hdr, err := ParseHeader(data[offset:])
 		if err != nil {
 			offset++
@@ -246,7 +293,7 @@ func (s *UdpServer) handlePacket(data []byte, addr *net.UDPAddr, ts int64) {
 		bodyStart := offset + UnibHdrLen
 		bodyEnd := bodyStart + hdr.BodyLen
 		body := data[bodyStart:bodyEnd]
-		
+
 		// Update Gateway Map
 		tagID := int(hdr.Addr)
 		s.mu.Lock()
@@ -262,7 +309,7 @@ func (s *UdpServer) handlePacket(data []byte, addr *net.UDPAddr, ts int64) {
 func (s *UdpServer) processInner(hdr *UnibHeader, body []byte, ts int64, parentFlags uint8) {
 	combinedFlags := hdr.Flags | parentFlags
 	realBody := body
-	if combinedFlags & 0x2 != 0 && len(body) > 0 {
+	if combinedFlags&0x2 != 0 && len(body) > 0 {
 		realBody = body[1:]
 	}
 
@@ -285,12 +332,12 @@ func (s *UdpServer) processInner(hdr *UnibHeader, body []byte, ts int64, parentF
 				pos++
 				continue
 			}
-			
+
 			totalLen := UnibWrapLen + inHdr.BodyLen
 			if pos+totalLen > len(innerPayload) {
 				break
 			}
-			
+
 			inBody := innerPayload[pos+UnibHdrLen : pos+UnibHdrLen+inHdr.BodyLen]
 			s.processInner(inHdr, inBody, ts, hdr.Flags)
 			pos += totalLen
@@ -331,8 +378,9 @@ func (s *UdpServer) processInner(hdr *UnibHeader, body []byte, ts int64, parentF
 	case TypeImuFrame:
 		imu, extraBytes, err := ParseImuFrame(realBody)
 		if err == nil {
-			s.pipeline.ProcessIMU(ts, imu.DistanceM, imu.YawDeg)
-			
+			p := s.getPipeline(tagID)
+			p.ProcessIMU(ts, imu.DistanceM, imu.YawDeg)
+
 			extra := ParseExdEntries(extraBytes)
 			if extra.Pressure != nil || extra.Temperature != nil {
 				s.handleExd(tagID, ts, extra)
@@ -352,7 +400,8 @@ func (s *UdpServer) feedTwr(tagID int, ts int64, samples []TwrSample, extra ExdD
 			Range:    smp.RangeM,
 		}
 	}
-	res := s.pipeline.Process(ts, tagID, []fusion.BLEMeas{}, twrMeas, 0.0)
+	p := s.getPipeline(tagID)
+	res := p.Process(ts, tagID, []fusion.BLEMeas{}, twrMeas, 0.0)
 	s.sendResult(tagID, ts, res, extra)
 }
 
@@ -364,21 +413,25 @@ func (s *UdpServer) feedRssi(tagID int, ts int64, samples []RssiSample, extra Ex
 			RSSIDb:   smp.RSSIDb,
 		}
 	}
-	res := s.pipeline.Process(ts, tagID, bleMeas, []fusion.TWRMeas{}, 0.0)
+	p := s.getPipeline(tagID)
+	res := p.Process(ts, tagID, bleMeas, []fusion.TWRMeas{}, 0.0)
 	s.sendResult(tagID, ts, res, extra)
 }
 
 func (s *UdpServer) sendResult(tagID int, ts int64, res fusion.FusionResult, extra ExdData) {
-	// Debug logging for large coordinates
+	// Debug logging for large coordinates AND hard safety clamp
 	if math.Abs(res.X) > 1000.0 || math.Abs(res.Y) > 1000.0 {
 		log.Printf("WARNING: Large Coordinate detected! Tag=%x X=%.2f Y=%.2f", tagID, res.X, res.Y)
+		// Drop the point to avoid contaminating downstream outputs
+		res.Flag = -2
+		res.X, res.Y = 0, 0
 	}
 
 	// Debug logging for Replay tracking
-	if res.Flag > 0 && tagID % 10 == 0 {
+	if res.Flag > 0 && tagID%10 == 0 {
 		// log.Printf("Pos: ID=%x Flag=%d X=%.2f Y=%.2f", tagID, res.Flag, res.X, res.Y)
 	}
-	
+
 	region := 0
 	if res.Layer != nil {
 		region = *res.Layer
@@ -402,19 +455,19 @@ func (s *UdpServer) sendResult(tagID int, ts int64, res fusion.FusionResult, ext
 		})
 		s.csvWriter.Flush()
 	}
-	
+
 	pos := &wsPos{
-		ID:    int64(tagID),
-		TS:    ts,
-		X:     res.X,
-		Y:     res.Y,
-		Z:     0.0,
-		Layer: region,
-		Flag:  res.Flag,
-		Pressure: extra.Pressure,
+		ID:          int64(tagID),
+		TS:          ts,
+		X:           res.X,
+		Y:           res.Y,
+		Z:           0.0,
+		Layer:       region,
+		Flag:        res.Flag,
+		Pressure:    extra.Pressure,
 		Temperature: extra.Temperature,
 	}
-	
+
 	// Update State (Always update, even if invalid/predictive)
 	s.mu.Lock()
 	if oldState, ok := s.tagsState[tagID]; ok {

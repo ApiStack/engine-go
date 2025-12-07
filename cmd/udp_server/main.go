@@ -58,10 +58,9 @@ func main() {
 	layerManager := fusion.LayerManagerFromConfig(*projectXML, *wogiXML, anchors)
 
 	rssiModel := fusion.NewBLERssi(*signalLoss, *signalAdjust, *deployDist)
-	pipeline := fusion.NewFusionPipeline(anchors, rssiModel, dimMap, beaconLayer, beaconDims, layerManager)
 
 	// Initialize Server
-	udpSvr, err := server.NewUdpServer(*port, pipeline)
+	udpSvr, err := server.NewUdpServer(*port, anchors, rssiModel, dimMap, beaconLayer, beaconDims, layerManager)
 	if err != nil {
 		log.Fatalf("Failed to create UDP server: %v", err)
 	}
@@ -110,7 +109,7 @@ func main() {
 		if fi, err := os.Stat(path); err == nil && fi.IsDir() {
 			path = fmt.Sprintf("%s/PKTSBIN_%s.pcap", path, time.Now().Format("20060102150405"))
 		}
-		
+
 		pw, err := binlog.NewPcapWriter(path)
 		if err != nil {
 			log.Fatalf("Failed to create pcap writer: %v", err)
